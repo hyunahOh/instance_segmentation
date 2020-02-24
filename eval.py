@@ -1044,9 +1044,7 @@ def print_maps(all_maps):
     print(make_sep(len(all_maps['box']) + 1))
     print()
 
-
-
-if __name__ == '__main__':
+def detect_img():
     parse_args()
 
     if args.config is not None:
@@ -1105,3 +1103,5 @@ if __name__ == '__main__':
         evaluate(net, dataset)
 
 
+if __name__ == '__main__':
+    detect_img()
