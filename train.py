@@ -24,6 +24,11 @@ import datetime
 # Oof
 import eval as eval_script
 
+# Mlflow
+import mlflow
+from mlflow import log_metric, log_param, log_artifacts
+# mlflow.set_tracking_uri('http://147.46.215.105/mlflow')
+
 def str2bool(v):
     return v.lower() in ("yes", "true", "t", "1")
 
@@ -38,7 +43,7 @@ parser.add_argument('--resume', default=None, type=str,
 parser.add_argument('--start_iter', default=-1, type=int,
                     help='Resume training at this iter. If this is -1, the iteration will be'\
                          'determined from the file name.')
-parser.add_argument('--num_workers', default=1, type=int,
+parser.add_argument('--num_workers', default=4, type=int,
                     help='Number of workers used in dataloading')
 parser.add_argument('--cuda', default=True, type=str2bool,
                     help='Use CUDA to train model')
@@ -170,219 +175,236 @@ class CustomDataParallel(nn.DataParallel):
         return out
 
 def train():
-    if not os.path.exists(args.save_folder):
-        os.mkdir(args.save_folder)
 
-    dataset = COCODetection(image_path=cfg.dataset.train_images,
-                            info_file=cfg.dataset.train_info,
-                            transform=SSDAugmentation(MEANS))
-    
-    if args.validation_epoch > 0:
-        setup_eval()
-        val_dataset = COCODetection(image_path=cfg.dataset.valid_images,
-                                    info_file=cfg.dataset.valid_info,
-                                    transform=BaseTransform(MEANS))
+    mlflow.set_experiment("haoh/CocoSeg")
+    with mlflow.start_run():
 
-    # Parallel wraps the underlying module, but when saving and loading we don't want that
-    yolact_net = Yolact()
-    net = yolact_net
-    net.train()
+        ### MLflow - Seperate Weight folder between Runs
+        save_folder = args.save_folder+mlflow.active_run().info.run_id
+        if not os.path.exists(save_folder):
+            os.mkdir(save_folder)
+        mlflow.log_artifacts(save_folder)
 
-    if args.log:
-        log = Log(cfg.name, args.log_folder, dict(args._get_kwargs()),
-            overwrite=(args.resume is None), log_gpu_stats=args.log_gpu)
+        dataset = COCODetection(image_path=cfg.dataset.train_images,
+                                info_file=cfg.dataset.train_info,
+                                transform=SSDAugmentation(MEANS))
+        
+        if args.validation_epoch > 0:
+            setup_eval()
+            val_dataset = COCODetection(image_path=cfg.dataset.valid_images,
+                                        info_file=cfg.dataset.valid_info,
+                                        transform=BaseTransform(MEANS))
 
-    # I don't use the timer during training (I use a different timing method).
-    # Apparently there's a race condition with multiple GPUs, so disable it just to be safe.
-    timer.disable_all()
+        # Parallel wraps the underlying module, but when saving and loading we don't want that
+        yolact_net = Yolact()
+        net = yolact_net
+        net.train()
 
-    # Both of these can set args.resume to None, so do them before the check    
-    if args.resume == 'interrupt':
-        args.resume = SavePath.get_interrupt(args.save_folder)
-    elif args.resume == 'latest':
-        args.resume = SavePath.get_latest(args.save_folder, cfg.name)
+        if args.log:
+            log = Log(cfg.name, args.log_folder, dict(args._get_kwargs()),
+                overwrite=(args.resume is None), log_gpu_stats=args.log_gpu)
 
-    if args.resume is not None:
-        print('Resuming training, loading {}...'.format(args.resume))
-        yolact_net.load_weights(args.resume)
+        # I don't use the timer during training (I use a different timing method).
+        # Apparently there's a race condition with multiple GPUs, so disable it just to be safe.
+        timer.disable_all()
 
-        if args.start_iter == -1:
-            args.start_iter = SavePath.from_str(args.resume).iteration
-    else:
-        print('Initializing weights...')
-        yolact_net.init_weights(backbone_path=args.save_folder + cfg.backbone.path)
+        # Both of these can set args.resume to None, so do them before the check    
+        if args.resume == 'interrupt':
+            args.resume = SavePath.get_interrupt(args.save_folder)
+        elif args.resume == 'latest':
+            args.resume = SavePath.get_latest(args.save_folder, cfg.name)
 
-    optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
-                          weight_decay=args.decay)
-    criterion = MultiBoxLoss(num_classes=cfg.num_classes,
-                             pos_threshold=cfg.positive_iou_threshold,
-                             neg_threshold=cfg.negative_iou_threshold,
-                             negpos_ratio=cfg.ohem_negpos_ratio)
+        if args.resume is not None:
+            print('Resuming training, loading {}...'.format(args.resume))
+            yolact_net.load_weights(args.resume)
 
-    if args.batch_alloc is not None:
-        args.batch_alloc = [int(x) for x in args.batch_alloc.split(',')]
-        if sum(args.batch_alloc) != args.batch_size:
-            print('Error: Batch allocation (%s) does not sum to batch size (%s).' % (args.batch_alloc, args.batch_size))
-            exit(-1)
+            if args.start_iter == -1:
+                args.start_iter = SavePath.from_str(args.resume).iteration
+        else:
+            print('Initializing weights...')
+            yolact_net.init_weights(backbone_path=args.save_folder + cfg.backbone.path)
 
-    net = CustomDataParallel(NetLoss(net, criterion))
-    if args.cuda:
-        net = net.cuda()
-    
-    # Initialize everything
-    if not cfg.freeze_bn: yolact_net.freeze_bn() # Freeze bn so we don't kill our means
-    yolact_net(torch.zeros(1, 3, cfg.max_size, cfg.max_size).cuda())
-    if not cfg.freeze_bn: yolact_net.freeze_bn(True)
+        optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
+                            weight_decay=args.decay)
+        criterion = MultiBoxLoss(num_classes=cfg.num_classes,
+                                pos_threshold=cfg.positive_iou_threshold,
+                                neg_threshold=cfg.negative_iou_threshold,
+                                negpos_ratio=cfg.ohem_negpos_ratio)
 
-    # loss counters
-    loc_loss = 0
-    conf_loss = 0
-    iteration = max(args.start_iter, 0)
-    last_time = time.time()
+        if args.batch_alloc is not None:
+            args.batch_alloc = [int(x) for x in args.batch_alloc.split(',')]
+            if sum(args.batch_alloc) != args.batch_size:
+                print('Error: Batch allocation (%s) does not sum to batch size (%s).' % (args.batch_alloc, args.batch_size))
+                exit(-1)
 
-    epoch_size = len(dataset) // args.batch_size
-    num_epochs = math.ceil(cfg.max_iter / epoch_size)
-    
-    # Which learning rate adjustment step are we on? lr' = lr * gamma ^ step_index
-    step_index = 0
+        net = CustomDataParallel(NetLoss(net, criterion))
+        if args.cuda:
+            net = net.cuda()
+        
+        # Initialize everything
+        if not cfg.freeze_bn: yolact_net.freeze_bn() # Freeze bn so we don't kill our means
+        yolact_net(torch.zeros(1, 3, cfg.max_size, cfg.max_size).cuda())
+        if not cfg.freeze_bn: yolact_net.freeze_bn(True)
 
-    data_loader = data.DataLoader(dataset, args.batch_size,
-                                  num_workers=args.num_workers,
-                                  shuffle=True, collate_fn=detection_collate,
-                                  pin_memory=True)
-    
-    
-    save_path = lambda epoch, iteration: SavePath(cfg.name, epoch, iteration).get_path(root=args.save_folder)
-    time_avg = MovingAverage()
+        # loss counters
+        loc_loss = 0
+        conf_loss = 0
+        iteration = max(args.start_iter, 0)
+        last_time = time.time()
 
-    global loss_types # Forms the print order
-    loss_avgs  = { k: MovingAverage(100) for k in loss_types }
+        epoch_size = len(dataset) // args.batch_size
+        num_epochs = math.ceil(cfg.max_iter / epoch_size)
+        
+        # Which learning rate adjustment step are we on? lr' = lr * gamma ^ step_index
+        step_index = 0
 
-    print('Begin training!')
-    print()
-    # try-except so you can use ctrl+c to save early and stop training
-    try:
-        for epoch in range(num_epochs):
-            # Resume from start_iter
-            if (epoch+1)*epoch_size < iteration:
-                continue
-            
-            for datum in data_loader:
-                # Stop if we've reached an epoch if we're resuming from start_iter
-                if iteration == (epoch+1)*epoch_size:
-                    break
+        data_loader = data.DataLoader(dataset, args.batch_size,
+                                    num_workers=args.num_workers,
+                                    shuffle=True, collate_fn=detection_collate,
+                                    pin_memory=True)
+        
+        
+        save_path = lambda epoch, iteration: SavePath(cfg.name, epoch, iteration).get_path(root=save_folder)
+        time_avg = MovingAverage()
 
-                # Stop at the configured number of iterations even if mid-epoch
-                if iteration == cfg.max_iter:
-                    break
+        global loss_types # Forms the print order
+        loss_avgs  = { k: MovingAverage(100) for k in loss_types }
 
-                # Change a config setting if we've reached the specified iteration
-                changed = False
-                for change in cfg.delayed_settings:
-                    if iteration >= change[0]:
-                        changed = True
-                        cfg.replace(change[1])
+        ### Mlflow logging
+        mlflow.log_param('lr', args.lr)
+        mlflow.log_param('epochs', num_epochs)
+        mlflow.log_param('momentum', args.momentum)
+        mlflow.log_param('gamma', args.gamma)
+        mlflow.log_param('decay', args.decay)
 
-                        # Reset the loss averages because things might have changed
-                        for avg in loss_avgs:
-                            avg.reset()
+        print('Begin training!')
+        print()
+        # try-except so you can use ctrl+c to save early and stop training
+        try:
+            for epoch in range(num_epochs):
+                # Resume from start_iter
+                if (epoch+1)*epoch_size < iteration:
+                    continue
                 
-                # If a config setting was changed, remove it from the list so we don't keep checking
-                if changed:
-                    cfg.delayed_settings = [x for x in cfg.delayed_settings if x[0] > iteration]
+                for datum in data_loader:
+                    # Stop if we've reached an epoch if we're resuming from start_iter
+                    if iteration == (epoch+1)*epoch_size:
+                        break
 
-                # Warm up by linearly interpolating the learning rate from some smaller value
-                if cfg.lr_warmup_until > 0 and iteration <= cfg.lr_warmup_until:
-                    set_lr(optimizer, (args.lr - cfg.lr_warmup_init) * (iteration / cfg.lr_warmup_until) + cfg.lr_warmup_init)
+                    # Stop at the configured number of iterations even if mid-epoch
+                    if iteration == cfg.max_iter:
+                        break
 
-                # Adjust the learning rate at the given iterations, but also if we resume from past that iteration
-                while step_index < len(cfg.lr_steps) and iteration >= cfg.lr_steps[step_index]:
-                    step_index += 1
-                    set_lr(optimizer, args.lr * (args.gamma ** step_index))
-                
-                # Zero the grad to get ready to compute gradients
-                optimizer.zero_grad()
+                    # Change a config setting if we've reached the specified iteration
+                    changed = False
+                    for change in cfg.delayed_settings:
+                        if iteration >= change[0]:
+                            changed = True
+                            cfg.replace(change[1])
 
-                # Forward Pass + Compute loss at the same time (see CustomDataParallel and NetLoss)
-                losses = net(datum)
-                
-                losses = { k: (v).mean() for k,v in losses.items() } # Mean here because Dataparallel
-                loss = sum([losses[k] for k in losses])
-                
-                # no_inf_mean removes some components from the loss, so make sure to backward through all of it
-                # all_loss = sum([v.mean() for v in losses.values()])
-
-                # Backprop
-                loss.backward() # Do this to free up vram even if loss is not finite
-                if torch.isfinite(loss).item():
-                    optimizer.step()
-                
-                # Add the loss to the moving average for bookkeeping
-                for k in losses:
-                    loss_avgs[k].add(losses[k].item())
-
-                cur_time  = time.time()
-                elapsed   = cur_time - last_time
-                last_time = cur_time
-
-                # Exclude graph setup from the timing information
-                if iteration != args.start_iter:
-                    time_avg.add(elapsed)
-
-                if iteration % 10 == 0:
-                    eta_str = str(datetime.timedelta(seconds=(cfg.max_iter-iteration) * time_avg.get_avg())).split('.')[0]
+                            # Reset the loss averages because things might have changed
+                            for avg in loss_avgs:
+                                avg.reset()
                     
-                    total = sum([loss_avgs[k].get_avg() for k in losses])
-                    loss_labels = sum([[k, loss_avgs[k].get_avg()] for k in loss_types if k in losses], [])
+                    # If a config setting was changed, remove it from the list so we don't keep checking
+                    if changed:
+                        cfg.delayed_settings = [x for x in cfg.delayed_settings if x[0] > iteration]
+
+                    # Warm up by linearly interpolating the learning rate from some smaller value
+                    if cfg.lr_warmup_until > 0 and iteration <= cfg.lr_warmup_until:
+                        set_lr(optimizer, (args.lr - cfg.lr_warmup_init) * (iteration / cfg.lr_warmup_until) + cfg.lr_warmup_init)
+
+                    # Adjust the learning rate at the given iterations, but also if we resume from past that iteration
+                    while step_index < len(cfg.lr_steps) and iteration >= cfg.lr_steps[step_index]:
+                        step_index += 1
+                        set_lr(optimizer, args.lr * (args.gamma ** step_index))
                     
-                    print(('[%3d] %7d ||' + (' %s: %.3f |' * len(losses)) + ' T: %.3f || ETA: %s || timer: %.3f')
+                    # Zero the grad to get ready to compute gradients
+                    optimizer.zero_grad()
+
+                    # Forward Pass + Compute loss at the same time (see CustomDataParallel and NetLoss)
+                    losses = net(datum)
+                    
+                    losses = { k: (v).mean() for k,v in losses.items() } # Mean here because Dataparallel
+                    loss = sum([losses[k] for k in losses])
+                    
+                    # no_inf_mean removes some components from the loss, so make sure to backward through all of it
+                    # all_loss = sum([v.mean() for v in losses.values()])
+
+                    # Backprop
+                    loss.backward() # Do this to free up vram even if loss is not finite
+                    if torch.isfinite(loss).item():
+                        optimizer.step()
+                    
+                    # Add the loss to the moving average for bookkeeping
+                    for k in losses:
+                        loss_avgs[k].add(losses[k].item())
+
+                    cur_time  = time.time()
+                    elapsed   = cur_time - last_time
+                    last_time = cur_time
+
+                    # Exclude graph setup from the timing information
+                    if iteration != args.start_iter:
+                        time_avg.add(elapsed)
+
+                    if iteration % 10 == 0:
+                        eta_str = str(datetime.timedelta(seconds=(cfg.max_iter-iteration) * time_avg.get_avg())).split('.')[0]
+                        
+                        total = sum([loss_avgs[k].get_avg() for k in losses])
+                        loss_labels = sum([[k, loss_avgs[k].get_avg()] for k in loss_types if k in losses], [])
+                        
+                        print(('[%3d] %7d ||' + (' %s: %.3f |' * len(losses)) + ' T: %.3f || ETA: %s || timer: %.3f')
                             % tuple([epoch, iteration] + loss_labels + [total, eta_str, elapsed]), flush=True)
 
-                if args.log:
-                    precision = 5
-                    loss_info = {k: round(losses[k].item(), precision) for k in losses}
-                    loss_info['T'] = round(loss.item(), precision)
+                        for idx in range(0, len(loss_labels), 2):
+                            mlflow.log_metric("loss_"+loss_labels[idx], loss_labels[idx+1])
 
-                    if args.log_gpu:
-                        log.log_gpu_stats = (iteration % 10 == 0) # nvidia-smi is sloooow
-                        
-                    log.log('train', loss=loss_info, epoch=epoch, iter=iteration,
-                        lr=round(cur_lr, 10), elapsed=elapsed)
+                    if args.log:
+                        precision = 5
+                        loss_info = {k: round(losses[k].item(), precision) for k in losses}
+                        loss_info['T'] = round(loss.item(), precision)
 
-                    log.log_gpu_stats = args.log_gpu
+                        if args.log_gpu:
+                            log.log_gpu_stats = (iteration % 10 == 0) # nvidia-smi is sloooow
+                            
+                        log.log('train', loss=loss_info, epoch=epoch, iter=iteration,
+                            lr=round(cur_lr, 10), elapsed=elapsed)
+
+                        log.log_gpu_stats = args.log_gpu
+                    
+                    iteration += 1
+
+                    if iteration % args.save_interval == 0 and iteration != args.start_iter:
+                        if args.keep_latest:
+                            latest = SavePath.get_latest(save_folder, cfg.name)
+
+                        print('Saving state, iter:', iteration)
+                        yolact_net.save_weights(save_path(epoch, iteration))
+
+                        if args.keep_latest and latest is not None:
+                            if args.keep_latest_interval <= 0 or iteration % args.keep_latest_interval != args.save_interval:
+                                print('Deleting old save...')
+                                os.remove(latest)
                 
-                iteration += 1
-
-                if iteration % args.save_interval == 0 and iteration != args.start_iter:
-                    if args.keep_latest:
-                        latest = SavePath.get_latest(args.save_folder, cfg.name)
-
-                    print('Saving state, iter:', iteration)
-                    yolact_net.save_weights(save_path(epoch, iteration))
-
-                    if args.keep_latest and latest is not None:
-                        if args.keep_latest_interval <= 0 or iteration % args.keep_latest_interval != args.save_interval:
-                            print('Deleting old save...')
-                            os.remove(latest)
+                # This is done per epoch
+                if args.validation_epoch > 0:
+                    if epoch % args.validation_epoch == 0 and epoch > 0:
+                        compute_validation_map(epoch, iteration, yolact_net, val_dataset, log if args.log else None)
             
-            # This is done per epoch
-            if args.validation_epoch > 0:
-                if epoch % args.validation_epoch == 0 and epoch > 0:
-                    compute_validation_map(epoch, iteration, yolact_net, val_dataset, log if args.log else None)
-        
-        # Compute validation mAP after training is finished
-        compute_validation_map(epoch, iteration, yolact_net, val_dataset, log if args.log else None)
-    except KeyboardInterrupt:
-        if args.interrupt:
-            print('Stopping early. Saving network...')
-            
-            # Delete previous copy of the interrupted network so we don't spam the weights folder
-            SavePath.remove_interrupt(args.save_folder)
-            
-            yolact_net.save_weights(save_path(epoch, repr(iteration) + '_interrupt'))
-        exit()
+            # Compute validation mAP after training is finished
+            compute_validation_map(epoch, iteration, yolact_net, val_dataset, log if args.log else None)
+        except KeyboardInterrupt:
+            if args.interrupt:
+                print('Stopping early. Saving network...')
+                
+                # Delete previous copy of the interrupted network so we don't spam the weights folder
+                SavePath.remove_interrupt(save_folder)
+                
+                yolact_net.save_weights(save_path(epoch, repr(iteration) + '_interrupt'))
+            exit()
 
-    yolact_net.save_weights(save_path(epoch, iteration))
+        yolact_net.save_weights(save_path(epoch, iteration))
 
 
 def set_lr(optimizer, new_lr):
@@ -490,6 +512,7 @@ def compute_validation_map(epoch, iteration, yolact_net, dataset, log:Log=None):
         print()
         print("Computing validation mAP (this may take a while)...", flush=True)
         val_info = eval_script.evaluate(yolact_net, dataset, train_mode=True)
+
         end = time.time()
 
         if log is not None:
